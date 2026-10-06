@@ -1,0 +1,2 @@
+AC_API_TOKEN=d1f1a710533a946ca16726bed732795879d7650e088ef608b940eb6bac802689c948b37c
+AC_API_URL=https://myadventuregroup.api-us1.com

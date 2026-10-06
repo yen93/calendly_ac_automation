@@ -1,0 +1,30 @@
+Daily: Calendly booking source → ActiveCampaign
+
+
+Copies the traffic source (UTMs / Google or Bing click ID) of new Calendly bookings into the ActiveCampaign 'Src –' contact fields
+
+
+You are running MyAdventure Group's (MAG) daily lead-source sync for Clover (Marketing Manager). Goal: every new Calendly booking gets its traffic source copied onto the matching ActiveCampaign (AC) contact.
+
+
+BACKGROUND (so you understand the data)
+Since 5 Oct 2026 a script on myadventuregroup.com.au (WordPress → Tracking Code Manager #5 "MAG Lead Source Capture") adds the visitor's source to the Calendly embeds on /free-consult/. Calendly stores it on each invitee under "tracking": utm_source, utm_medium, utm_campaign, utm_content, utm_term, and salesforce_uuid (used to carry the ad click ID as "gclid:XXXX" or "msclkid:XXXX").
+When there's no UTM, the script sets utm_source to a plain channel label (e.g. "Organic search", "Direct", "Referral", "AI assistant").
+STEPS
+1. Calendly connector: call users-get_current_user (James Castrission's account). Then meetings-list_events for that user with min_start_time unrestricted but only events whose created_at is in the last 3 days (list by start_time desc, count 100, include future events; filter by created_at locally). Include active events only.
+2. For each event, call meetings-list_event_invitees. For each invitee collect: email, name, created_at, tracking.utm_source/utm_medium/utm_campaign/utm_term, tracking.salesforce_uuid.
+3. Skip invitees that are internal (@myadventuregroup.com.au) or obvious tests (name/email contains "test").
+4. Work out values:
+   - gclid = part after "gclid:" in salesforce_uuid (else blank); msclkid = part after "msclkid:" (else blank).
+   - Lead channel: "Google Ads" if gclid, or utm_medium in (cpc,ppc,paid) with google source; "Microsoft Ads" if msclkid, or cpc with bing/microsoft source; "Email" if utm_medium=email; otherwise utm_source if it is one of the plain labels above; if tracking is completely empty write "Unknown (no tracking)".
+5. ActiveCampaign connector: find the contact by email (list_contacts with email filter). If no contact exists, do NOT create one — just list it in the report.
+6. Only write when the contact's field 77 is currently EMPTY (never overwrite existing source data). Write these contact custom field values (use create_contact_field_value / update as needed):
+   77 Src - Lead channel · 78 Src - UTM source · 79 Src - UTM medium · 80 Src - UTM campaign · 81 Src - UTM term · 82 Src - Google Ads click ID (gclid) · 83 Src - Microsoft Ads click ID (msclkid). Leave 84–87 (landing page, referrer, first-touch) blank — Calendly doesn't provide them.
+7. Do not change tags, lists, deals or any other field. Read-only everywhere except those field values.
+
+
+OUTPUT (short, plain language)
+One line per booking processed: masked name (first name + last initial), company domain, booking date, channel written (or "skipped – already had source" / "no AC contact").
+Totals: X bookings · Google Ads N · Microsoft Ads N · Organic N · Other N · Unknown N.
+Flag anything odd (e.g. a booking with no tracking at all after 5 Oct 2026 may mean the embed lost the script — say so).
+If there were no new bookings, say "No new Calendly bookings in the last 3 days" and stop.
