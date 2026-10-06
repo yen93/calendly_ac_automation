@@ -262,14 +262,23 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
   // Persist the run.
   try {
     const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-    const { error } = await db.from("calendly_src_sync_runs").insert({
+    const { data: runRow, error } = await db.from("calendly_src_sync_runs").insert({
       days_window: s.days_window, dry_run: s.dry_run, bookings_processed: s.bookings_processed,
       total_google_ads: s.total_google_ads, total_microsoft_ads: s.total_microsoft_ads,
       total_organic: s.total_organic, total_other: s.total_other, total_unknown: s.total_unknown,
       written: s.written, skipped_existing: s.skipped_existing, no_ac_contact: s.no_ac_contact,
-      flags: s.flags, report: s.report, errors: s.errors,
-    });
+      flags: s.flags, errors: s.errors,
+    }).select("id").single();
     if (error) s.errors.push(`log insert: ${error.message}`);
+    // One row per booking in the child table (so detail is queryable, no JSON array).
+    else if (runRow && s.report.length) {
+      const rows = s.report.map((r: any) => ({
+        run_id: runRow.id, name: r.name, domain: r.domain,
+        booking_date: r.booking_date || null, channel: r.channel, action: r.action,
+      }));
+      const { error: bErr } = await db.from("calendly_src_sync_bookings").insert(rows);
+      if (bErr) s.errors.push(`bookings insert: ${bErr.message}`);
+    }
   } catch (err) { s.errors.push(`log insert failed: ${err}`); }
 
   console.log("calendly-source-sync summary:", JSON.stringify({ ...s, report: `${s.report.length} lines` }));

@@ -1,0 +1,7 @@
+# Secrets — never commit
+ac_creds.txt
+*creds*.txt
+*token*.txt
+*.env
+.env
+secrets/
