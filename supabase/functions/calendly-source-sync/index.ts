@@ -5,13 +5,15 @@
 // the visitor's source into the Calendly embeds on myadventuregroup.com.au/free-consult/.
 // Calendly stores it per invitee under `tracking`: utm_source/medium/campaign/term/content
 // and salesforce_uuid (which carries the ad click id as "gclid:XXXX" / "msclkid:XXXX").
-// This function reads the last few days of bookings and writes that source to AC — but
-// ONLY when the contact's field 77 is empty (never overwrites existing source data), and
-// never creates contacts or touches tags/lists/deals. It complements new-paid-leads-sync,
-// which later mirrors AC fields 77-87 into public.ac_new_leads for the dashboard.
+// This function reads the last few days of bookings and writes that source to AC, writing
+// field 77 ONLY when it is empty (never overwrites existing source data). If no AC contact
+// matches the booking email it CREATES the contact. It then tags the contact:
+// "supabase_calendly_ac_automation_new_contact" when created, or
+// "supabase_calendly_ac_automation_update" when an existing contact was updated. Touches no
+// other fields/lists/deals. Complements new-paid-leads-sync (mirrors 77-87 into ac_new_leads).
 //
 // Runs Mon-Fri 06:00 Philippine time via pg_cron ('0 22 * * 0-4' UTC). Each run is logged
-// to public.calendly_src_sync_runs.
+// to public.calendly_src_sync_runs (summary) + public.calendly_src_sync_bookings (per booking).
 //
 // Invoke: GET/POST (bare = real run, days=3). Query params:
 //   ?days=N      look back N days by booking created_at (default 3)
@@ -30,7 +32,6 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 // carry tracking; one that doesn't may mean the embed lost the capture script.
 const CAPTURE_LIVE_UTC = "2026-10-04T16:00:00Z";
 const DAYS_DEFAULT = 3;
-const INTERNAL_DOMAIN = "@myadventuregroup.com.au";
 // Plain channel labels the capture script writes into utm_source when there's no real UTM.
 const PLAIN_LABELS = new Set(["organic search", "direct", "referral", "ai assistant"]);
 
@@ -38,6 +39,11 @@ const PLAIN_LABELS = new Set(["organic search", "direct", "referral", "ai assist
 // landing-page / referrer / first-touch data).
 const F_LEAD_CHANNEL = 77, F_UTM_SOURCE = 78, F_UTM_MEDIUM = 79, F_UTM_CAMPAIGN = 80,
   F_UTM_TERM = 81, F_GCLID = 82, F_MSCLKID = 83;
+
+// Tags applied by this automation: one when it creates a new contact, one when it
+// only updates an existing contact's Src fields.
+const TAG_NEW_CONTACT = "supabase_calendly_ac_automation_new_contact";
+const TAG_UPDATE = "supabase_calendly_ac_automation_update";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const json = (body: unknown, status = 200) =>
@@ -130,16 +136,32 @@ async function acGet(path: string): Promise<any | null> {
     return await r.json();
   } catch (err) { console.warn(`AC fetch failed for ${path}: ${err}`); return null; }
 }
-async function acWrite(method: "POST" | "PUT", path: string, body: unknown): Promise<boolean> {
+// Returns the parsed response body on success, or null on failure.
+async function acSend(method: "POST" | "PUT", path: string, body: unknown): Promise<any | null> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const r = await fetch(`${AC_API_URL}/api/3/${path}`, { method, headers: acHeaders, body: JSON.stringify(body) });
       if (r.status === 429) { await sleep(1500); continue; }
-      if (!r.ok) { console.warn(`AC ${method} ${r.status} for ${path}: ${await r.text()}`); return false; }
-      return true;
+      if (!r.ok) { console.warn(`AC ${method} ${r.status} for ${path}: ${await r.text()}`); return null; }
+      return await r.json().catch(() => ({}));
     } catch (err) { console.warn(`AC ${method} failed for ${path}: ${err}`); await sleep(1000); }
   }
-  return false;
+  return null;
+}
+
+// Get-or-create a contact tag by name; returns its id (or null).
+async function ensureTag(name: string): Promise<string | null> {
+  const found = await acGet(`tags?search=${encodeURIComponent(name)}`);
+  const hit = (found?.tags ?? []).find((t: any) => t.tag === name);
+  if (hit?.id) return String(hit.id);
+  const made = await acSend("POST", "tags", { tag: { tag: name, tagType: "contact", description: "calendly-source-sync" } });
+  return made?.tag?.id ? String(made.tag.id) : null;
+}
+
+// Apply a tag id to a contact (idempotent server-side).
+async function tagContact(contactId: string, tagId: string | null): Promise<boolean> {
+  if (!tagId) return false;
+  return (await acSend("POST", "contactTags", { contactTag: { contact: contactId, tag: tagId } })) !== null;
 }
 
 // ---- Derivation ----------------------------------------------------------
@@ -177,7 +199,7 @@ interface Summary {
   bookings_processed: number;
   total_google_ads: number; total_microsoft_ads: number; total_organic: number;
   total_other: number; total_unknown: number;
-  written: number; skipped_existing: number; no_ac_contact: number;
+  created: number; updated: number; skipped_existing: number;
   flags: string[]; report: any[]; errors: string[]; message?: string;
 }
 
@@ -185,11 +207,19 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
   const s: Summary = {
     fn: "calendly-source-sync", ran_at: new Date().toISOString(), days_window: days, dry_run: dryRun,
     bookings_processed: 0, total_google_ads: 0, total_microsoft_ads: 0, total_organic: 0,
-    total_other: 0, total_unknown: 0, written: 0, skipped_existing: 0, no_ac_contact: 0,
+    total_other: 0, total_unknown: 0, created: 0, updated: 0, skipped_existing: 0,
     flags: [], report: [], errors: [],
   };
   if (!CALENDLY_PAT) s.errors.push("missing CALENDLY_PAT");
   if (!AC_API_URL || !AC_API_TOKEN) s.errors.push("missing AC credentials");
+
+  // Resolve (get-or-create) the two automation tags once per real run.
+  let tagNewId: string | null = null, tagUpdateId: string | null = null;
+  if (!dryRun) {
+    tagNewId = await ensureTag(TAG_NEW_CONTACT);
+    tagUpdateId = await ensureTag(TAG_UPDATE);
+    if (!tagNewId || !tagUpdateId) s.errors.push("could not resolve one or both automation tags");
+  }
 
   const bookings = await fetchBookings(days, s.errors);
   const captureLiveMs = Date.parse(CAPTURE_LIVE_UTC);
@@ -197,9 +227,9 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
   const seen = new Set<string>();
 
   for (const i of bookings) {
-    if (!i.email) continue;
-    if (i.email.endsWith(INTERNAL_DOMAIN)) continue;
-    if (i.email.includes("test") || low(i.name).includes("test")) continue;
+    if (!i.email) continue; // still need an email to look up / create the AC contact
+    // NOTE: no internal (@myadventuregroup.com.au) or "test" filtering — every active
+    // Calendly booking is processed, regardless of how legit the name/email looks.
     if (seen.has(i.email)) continue;
     seen.add(i.email);
     s.bookings_processed++;
@@ -211,7 +241,7 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
 
     const domain = i.email.split("@")[1] ?? "";
     const bookingDate = (i.created_at || "").slice(0, 10);
-    const line: any = { name: maskName(i.name, i.email), domain, booking_date: bookingDate, channel };
+    const line: any = { name: maskName(i.name, i.email), email: i.email, ac_contact_id: null, domain, booking_date: bookingDate, channel };
 
     // Anomaly: booking after capture went live but no tracking at all.
     const createdMs = Date.parse(i.created_at);
@@ -220,19 +250,42 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
       s.flags.push(`${line.name} (${domain}) booked ${bookingDate} with no tracking after 5 Oct — embed may have lost the capture script`);
     }
 
-    // Find AC contact by email (with field values embedded).
+    // Look up AC contact by email (field values embedded).
     const c = await acGet(`contacts?email=${encodeURIComponent(i.email)}&include=fieldValues`);
-    const contact = c?.contacts?.[0];
-    if (!contact) { line.action = "no AC contact"; s.no_ac_contact++; s.report.push(line); continue; }
-    const contactId = String(contact.id);
+    let contact = c?.contacts?.[0] ?? null;
 
-    // Existing field values for THIS contact: fieldId -> {id, value}.
+    // Existing Src field values for a matched contact: fieldId -> {id, value}.
     const existing = new Map<number, { id: string; value: string }>();
-    for (const fv of (c.fieldValues ?? [])) {
-      if (String(fv.contact) === contactId) existing.set(Number(fv.field), { id: String(fv.id), value: clean(fv.value) });
+    if (contact) {
+      const cid = String(contact.id);
+      line.ac_contact_id = cid;
+      for (const fv of (c.fieldValues ?? [])) {
+        if (String(fv.contact) === cid) existing.set(Number(fv.field), { id: String(fv.id), value: clean(fv.value) });
+      }
+      // Never overwrite: skip when field 77 is already set.
+      if (existing.get(F_LEAD_CHANNEL)?.value) { line.action = "skipped – already had source"; s.skipped_existing++; s.report.push(line); continue; }
     }
-    // Never overwrite: only write when field 77 is currently empty.
-    if (existing.get(F_LEAD_CHANNEL)?.value) { line.action = "skipped – already had source"; s.skipped_existing++; s.report.push(line); continue; }
+
+    const willCreate = !contact;
+
+    if (dryRun) {
+      line.action = willCreate ? `would create + write ${channel}` : `would write ${channel}`;
+      if (willCreate) s.created++; else s.updated++;
+      s.report.push(line); continue;
+    }
+
+    // 1. Create the contact if it doesn't exist yet (from the Calendly name + email).
+    if (willCreate) {
+      const parts = i.name.trim().split(/\s+/).filter(Boolean);
+      const made = await acSend("POST", "contacts", {
+        contact: { email: i.email, firstName: parts[0] ?? "", lastName: parts.length > 1 ? parts.slice(1).join(" ") : "" },
+      });
+      contact = made?.contact ?? null;
+      if (!contact) { line.action = "create failed"; s.errors.push(`contact create failed for ${i.email}`); s.report.push(line); continue; }
+      await sleep(250);
+    }
+    const contactId = String(contact.id);
+    line.ac_contact_id = contactId;
 
     const toWrite: Array<[number, string]> = [
       [F_LEAD_CHANNEL, channel],
@@ -240,20 +293,27 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
       [F_UTM_TERM, i.utm_term], [F_GCLID, gclid], [F_MSCLKID, msclkid],
     ].filter(([f, v]) => f === F_LEAD_CHANNEL || v); // 77 always; 78-83 only if non-empty
 
-    if (dryRun) { line.action = `would write ${channel}`; s.written++; s.report.push(line); continue; }
-
+    // 2. Write the Src fields (newly-created contacts have an empty `existing` map -> all POST).
     let ok = true;
     for (const [field, value] of toWrite) {
       const ex = existing.get(field);
       const done = ex
-        ? await acWrite("PUT", `fieldValues/${ex.id}`, { fieldValue: { value } })
-        : await acWrite("POST", "fieldValues", { fieldValue: { contact: contactId, field, value } });
-      if (!done) ok = false;
+        ? await acSend("PUT", `fieldValues/${ex.id}`, { fieldValue: { value } })
+        : await acSend("POST", "fieldValues", { fieldValue: { contact: contactId, field, value } });
+      if (done === null) ok = false;
       await sleep(250); // stay under AC's rate limit
     }
-    line.action = ok ? `wrote ${channel}` : `wrote ${channel} (with errors)`;
+
+    // 3. Tag: new-contact if we created it, update if we only updated an existing one.
+    if (!(await tagContact(contactId, willCreate ? tagNewId : tagUpdateId))) {
+      s.errors.push(`tagging failed for contact ${contactId} (${i.email})`);
+    }
+    await sleep(250);
+
+    const verb = willCreate ? "created + wrote" : "wrote";
+    line.action = ok ? `${verb} ${channel}` : `${verb} ${channel} (with errors)`;
     if (!ok) s.errors.push(`partial write for contact ${contactId} (${i.email})`);
-    s.written++;
+    if (willCreate) s.created++; else s.updated++;
     s.report.push(line);
   }
 
@@ -266,18 +326,21 @@ async function run(days: number, dryRun: boolean): Promise<Summary> {
       days_window: s.days_window, dry_run: s.dry_run, bookings_processed: s.bookings_processed,
       total_google_ads: s.total_google_ads, total_microsoft_ads: s.total_microsoft_ads,
       total_organic: s.total_organic, total_other: s.total_other, total_unknown: s.total_unknown,
-      written: s.written, skipped_existing: s.skipped_existing, no_ac_contact: s.no_ac_contact,
+      created: s.created, updated: s.updated, skipped_existing: s.skipped_existing,
       flags: s.flags, errors: s.errors,
     }).select("id").single();
     if (error) s.errors.push(`log insert: ${error.message}`);
-    // One row per booking in the child table (so detail is queryable, no JSON array).
-    else if (runRow && s.report.length) {
+    // One row per UNIQUE booking email, UPSERTed on email: re-processing the same email
+    // updates its row in place instead of adding a duplicate. Dry runs are previews, so
+    // they don't persist booking rows (they'd otherwise clobber a real row with "would…").
+    else if (runRow && !dryRun && s.report.length) {
+      const nowIso = new Date().toISOString();
       const rows = s.report.map((r: any) => ({
-        run_id: runRow.id, name: r.name, domain: r.domain,
-        booking_date: r.booking_date || null, channel: r.channel, action: r.action,
+        run_id: runRow.id, ran_at: nowIso, name: r.name, email: r.email, ac_contact_id: r.ac_contact_id,
+        domain: r.domain, booking_date: r.booking_date || null, channel: r.channel, action: r.action,
       }));
-      const { error: bErr } = await db.from("calendly_src_sync_bookings").insert(rows);
-      if (bErr) s.errors.push(`bookings insert: ${bErr.message}`);
+      const { error: bErr } = await db.from("calendly_src_sync_bookings").upsert(rows, { onConflict: "email" });
+      if (bErr) s.errors.push(`bookings upsert: ${bErr.message}`);
     }
   } catch (err) { s.errors.push(`log insert failed: ${err}`); }
 

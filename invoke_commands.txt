@@ -1,0 +1,48 @@
+================================================================
+ calendly-source-sync — manual invoke commands (Windows CMD)
+================================================================
+The function is deployed verify_jwt:false, so NO auth header is needed.
+Windows 10/11 has curl.exe built in — just paste a line into Command Prompt.
+
+Base URL:
+  https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync
+
+
+----------------------------------------------------------------
+1) DRY RUN — last 3 days (no AC writes; just shows what WOULD happen)
+----------------------------------------------------------------
+curl "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync?dryrun=1"
+
+
+----------------------------------------------------------------
+2) DRY RUN — last 7 days
+----------------------------------------------------------------
+curl "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync?dryrun=1&days=7"
+
+
+----------------------------------------------------------------
+3) REAL RUN — last 3 days (writes AC fields 77-83 where field 77 is empty)
+----------------------------------------------------------------
+curl "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync"
+
+
+----------------------------------------------------------------
+4) REAL RUN — last N days (change the 7)
+----------------------------------------------------------------
+curl "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync?days=7"
+
+
+================================================================
+ Notes
+================================================================
+- Bare call (no params) = REAL run, days=3 — the same thing the Mon-Fri
+  06:00 PHT cron does.
+- ?dryrun=1 does everything EXCEPT the AC writes (and logs the run with
+  dry_run = true). Use it to preview safely.
+- The JSON response prints the per-booking report + totals. Each run is
+  also logged to Supabase: calendly_src_sync_runs (summary) and
+  calendly_src_sync_bookings (one row per booking).
+- In Windows CMD the double quotes around the URL are REQUIRED (the & in
+  the query string otherwise splits the command).
+- If you'd rather pipe the response through a pretty-printer:
+    curl -s "https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync?dryrun=1" > out.json

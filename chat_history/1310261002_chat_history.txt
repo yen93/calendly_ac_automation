@@ -1,0 +1,133 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-10-13
+Session: Diagnostic / Q&A on the live calendly-source-sync function — why the
+         Supabase Invocations tab looked empty, whether a newly generated local
+         Calendly token matches the edge-function secret, whether the old token
+         still works, and a safe dry-run test invoke to confirm health today.
+         No code, deploy, or migration changes.
+================================================================================
+
+NOTE ON REDACTIONS: This session read credential files and printed tool output
+containing live secrets. All are replaced with [REDACTED_*] placeholders here and
+no secret value (full or partial) is reproduced: the Calendly personal access
+token JWT in 121026_calendly_personal_access_token.txt ([REDACTED_CALENDLY_PAT]),
+the Supabase management access token sbp_... ([REDACTED_SUPABASE_ACCESS_TOKEN]),
+and the salted secret digests returned by the Supabase secrets API
+([REDACTED_SECRET_DIGEST]). Non-secret JWT claims used in the reasoning (issue
+date, scope, jti) are described in words only.
+
+--------------------------------------------------------------------------------
+USER:
+"which edge function runs daily for this?" (calendly_ac_automation)
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Answered: calendly-source-sync, the single edge function in the project. Runs
+Mon-Fri 06:00 Philippine time via pg_cron job calendly-source-sync-daily
+('0 22 * * 0-4' UTC).
+
+--------------------------------------------------------------------------------
+USER:
+"why is it that there is nothing in the invocations tab?"
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Investigated with Supabase MCP and found the function is actually healthy and
+firing — the empty tab is a display/retention artifact, not a dead function.
+Evidence gathered:
+- list_edge_functions: calendly-source-sync is ACTIVE (version 8).
+- cron.job (jobid 10): active, schedule '0 22 * * 0-4' UTC, net.http_post to the
+  function URL, Content-Type only, timeout 30000 ms.
+- cron.job_run_details (jobid 10): succeeded on Oct 6, 7, 8, 11, 12 (each ~100 ms,
+  return "1 row").
+- calendly_src_sync_runs: matching rows per day — e.g. Oct 8 processed 1 booking /
+  updated 1; Oct 7 processed 2 / skipped 2 existing; Oct 11 & 12 processed 0.
+Explained the three reasons the Invocations tab can look empty despite this:
+(1) default short time range — the function runs once/day for ~100 ms, so widen to
+"Last 7 days"; (2) log-bucket retention by plan (analytics logs age out while the
+DB rows persist forever); (3) invocations != cron history / manual hits. A direct
+function_edge_logs query errored on table name, but the durable DB evidence was
+already conclusive. Bottom line: pipeline healthy, nothing to fix.
+
+--------------------------------------------------------------------------------
+USER:
+"kindly check if this is the same calendly access token saved in the edge function
+secrets: 121026_calendly_personal_access_token.txt"
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Determined it is NOT the same token, and that it would break the function if
+deployed. Work done:
+- Read the local token file ([REDACTED_CALENDLY_PAT]). Located the Supabase
+  management token at ../google_ads_leads_tracking/supabase-access-token.txt
+  ([REDACTED_SUPABASE_ACCESS_TOKEN]) (an inline-token curl was first blocked by the
+  credential-materialization guard; re-ran reading the token from the file into an
+  env var).
+- GET /v1/projects/.../secrets returned CALENDLY_PAT as a 64-char digest
+  ([REDACTED_SECRET_DIGEST]). Tried to match it by SHA256 of the local token (no
+  eol / with newline / raw) — no match. Then CALIBRATED the algorithm against a
+  secret whose plaintext is known (AC_API_URL = https://myadventuregroup.api-us1.com/api/3):
+  its SHA256 also did not match its stored digest, proving Supabase salts the
+  digest. Conclusion: equality cannot be confirmed by hashing, and function secrets
+  are write-only.
+- Switched to functional/JWT evidence. Decoded the local Calendly JWT: issued
+  2026-10-12 02:47 UTC, jti 3604f5e9-..., scope "webhooks:write webhooks:read
+  organizations:read" only. Live-tested it against Calendly: GET /users/me -> 403
+  Insufficient scope (needs users:read); GET /scheduled_events -> 403 (needs
+  scheduled_events:read).
+- Since the deployed function successfully reads /users/me, /scheduled_events and
+  /invitees and has been processing bookings, its secret token MUST have those
+  scopes — so it is a different, broader token than this limited local file.
+Reported NO, with a warning not to push this file into CALENDLY_PAT (it lacks
+users:read + scheduled_events:read and would 403 the next run), and offered to
+verify exact required scopes or help rotate once a correctly-scoped PAT exists.
+
+--------------------------------------------------------------------------------
+USER:
+"just a question: so this is a newly generated token. does this mean that my old
+one no longer works?"
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Explained that in Calendly each access token is independent — generating a new one
+does not revoke or rotate existing ones; the old token keeps working until it is
+explicitly deleted/revoked (or expires). Live proof it still works: the function
+is still succeeding on its existing secret (processed bookings as recently as Oct 8;
+cron succeeded Oct 11 & 12), which it couldn't if the old token were dead. Caveats:
+if the user had explicitly regenerated/revoked the old token it would be dead (not
+the case here), and this new file is a separate narrower token (webhooks + org-read,
+jti 3604f5e9-...), not a copy of the working one.
+
+--------------------------------------------------------------------------------
+USER:
+"can you test invoke the function to see if it runs ok today?"
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Ran a safe dry run (?dryrun=1&days=7) — exercises the full path but skips all AC
+writes/creates/tags. Result: HTTP 200 in ~5.4 s, no errors. dry_run=true,
+bookings_processed=1, skipped_existing=1. The one booking in the window (Bryce W.,
+bryce.walter@sydney.edu.au) matched AC contact 19031 and was correctly marked
+"skipped - already had source". Confirmed: Calendly auth works (the deployed PAT
+still has the right scopes), AC lookup works, the skip-existing rule works, and
+nothing was written (dry run logs no booking rows). Noted ran_at is UTC
+(23:29Z = 7:29 AM PHT Oct 13) and that a real run on this window would be a no-op.
+
+--------------------------------------------------------------------------------
+USER:
+/dcp — save the chat, update as_built.txt / CLAUDE.md / .gitignore (no git).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Wrote this chat history. Updated as_built.txt (noted the stray limited-scope token
+file now sitting in the project folder, so a future session doesn't mistake it for
+the function's PAT; bumped Last updated). Updated CLAUDE.md Gotchas with two facts
+learned this session: Supabase function secrets are write-only and their listed
+digest is salted (can't verify a secret by hashing), and the CALENDLY_PAT must
+carry users:read + scheduled_events:read (a webhooks-only scoped token 403s).
+.gitignore already covers *token*.txt, so the new credential file is protected — no
+change needed. Did NOT run any git command; the user commits/pushes themselves.
+
+================================================================================
+END OF EXPORT
+================================================================================

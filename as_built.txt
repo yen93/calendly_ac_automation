@@ -1,0 +1,100 @@
+================================================================================
+AS-BUILT — calendly_ac_automation (Calendly booking source -> ActiveCampaign)
+Last updated: 2026-10-14
+================================================================================
+
+WHAT THIS IS
+Copies the traffic source of NEW Calendly bookings onto the matching ActiveCampaign
+(AC) contact's "Src - *" custom fields (contact field ids 77-83), going forward.
+Runs unattended Mon-Fri 06:00 Philippine time as a Supabase edge function. Writes
+field 77 only when it is currently empty (never overwrites). If no AC contact matches
+the booking email it CREATES the contact, then writes the Src fields. It tags each
+contact it touches: supabase_calendly_ac_automation_new_contact (AC tag id 205) when
+created, supabase_calendly_ac_automation_update (id 206) when an existing contact was
+updated. Touches no other AC fields/lists/deals. Complements new-paid-leads-sync
+(dashboard repo), which later mirrors AC fields 77-87 into public.ac_new_leads.
+
+EDGE FUNCTION
+- supabase/functions/calendly-source-sync/index.ts — Deno/TypeScript. Reads Calendly
+  (James's account), derives lead channel + gclid/msclkid from each invitee's
+  tracking object, finds the AC contact by email, writes fields 77-83 when 77 empty,
+  and logs each run. Deployed to Supabase project aivitcomiywiysrfwqxt,
+  verify_jwt:false (version 9 as of this date).
+  Processes EVERY active booking: there is NO internal (@myadventuregroup.com.au)
+  or "test" name/email filtering (both skips were removed 2026-10-14). The only
+  skip is a missing email (can't look up / create an AC contact without one).
+  Base URL: https://aivitcomiywiysrfwqxt.supabase.co/functions/v1/calendly-source-sync
+  Query params: ?days=N (lookback by booking created_at, default 3);
+                ?dryrun=1 (do everything EXCEPT the AC writes).
+  Secrets (Supabase function secrets, never in repo): CALENDLY_PAT, AC_API_URL,
+  AC_API_TOKEN, plus auto-injected SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY.
+
+MIGRATIONS (SQL, applied to the live DB via Supabase MCP; kept here for the record)
+- supabase/migrations/20261006020000_create_calendly_src_sync_runs.sql — defines both
+  log tables (runs summary + per-booking child).
+- supabase/migrations/20261006020100_schedule_calendly_source_sync.sql — the cron.
+
+EXTERNAL INTEGRATIONS
+- Calendly (https://api.calendly.com) — REST v2, Bearer PAT. Endpoints: /users/me,
+  /scheduled_events, {event}/invitees. Credential: CALENDLY_PAT (Supabase secret;
+  local copy in repo-root calendly_personal_access_token.txt, gitignored).
+- ActiveCampaign (https://myadventuregroup.api-us1.com) — REST v3, "Api-Token" header.
+  Reads /api/3/contacts?email=...&include=fieldValues; writes /api/3/fieldValues
+  (POST new / PUT fieldValues/{id} existing). Credential: AC_API_TOKEN (Supabase
+  secret; local copy in ac_creds.txt, gitignored).
+- Supabase (project aivitcomiywiysrfwqxt, "MAGTestProject") — hosts the edge function
+  + log tables; cron via pg_cron + pg_net. Management access token used once to set
+  the CALENDLY_PAT secret (repo-root supabase-access-token.txt, gitignored).
+
+DATA STORES (Supabase, schema public; RLS on, no policies — service role writes)
+- calendly_src_sync_runs — one SUMMARY row per run: ran_at, days_window, dry_run,
+  bookings_processed, total_google_ads/microsoft_ads/organic/other/unknown, created,
+  updated, skipped_existing, flags text[], errors text[].
+- calendly_src_sync_bookings — one row per UNIQUE booking email (email has a unique
+  index; the function UPSERTs on email, never duplicates). Columns: run_id (FK ->
+  calendly_src_sync_runs.id, on delete cascade), ran_at, name (masked), email,
+  ac_contact_id, domain, booking_date (date), channel, action. Dry runs don't write
+  booking rows (previews only). (Replaced an earlier single "report" jsonb column on
+  the runs table, split out 2026-10-06.)
+
+AC TAGS (get-or-created by the function; applied to the contact it touches)
+- supabase_calendly_ac_automation_new_contact (tag id 205) — contact was created.
+- supabase_calendly_ac_automation_update     (tag id 206) — existing contact updated.
+
+AUTOMATIONS / ROUTINES
+- calendly-source-sync-daily (pg_cron jobid 10) — schedule '0 22 * * 0-4' UTC =
+  Mon-Fri 06:00 PHT. net.http_post to the function URL, Content-Type only (no auth
+  header, since verify_jwt:false), timeout 30000 ms.
+- Manual invoke: curl the base URL (see invoke_commands.txt). Bare = real run days=3.
+
+LEAD-CHANNEL LADDER (derived per booking)
+Google Ads (gclid, or cpc/ppc/paid + google source) · Microsoft Ads (msclkid, or cpc +
+bing/microsoft source) · Email (utm_medium=email) · a plain label (Organic search /
+Direct / Referral / AI assistant) · else the utm_source · else "Unknown (no tracking)".
+Fields 84-87 (landing page / referrer / first-touch) are left blank — Calendly has none.
+
+OTHER / FILES
+- README.md — overview + deploy/invoke notes.
+- invoke_commands.txt — ready-to-paste Windows CMD curl commands.
+- calendly-lead-source-sync.html — self-contained iMAG-themed guide page for the
+  automation (diagrams embedded as base64), built locally via the imag_page_local skill.
+- diagram-flow.png / diagram-decision.png — the two source PNGs for that guide page.
+- claude_task_prompt.txt / initial_prompt.md — the original automation spec + task.
+- chat_history/ — per-session narrative logs (ddMMyyHHmm_chat_history.txt).
+- (repo-root) calendly_personal_access_token.txt, (repo-root) supabase-access-token.txt
+  — live credentials, gitignored, never committed. (ac_creds.txt was removed from this
+  folder; the function uses the Supabase AC_API_TOKEN secret, not a local file.)
+- 121026_calendly_personal_access_token.txt (in THIS folder) — a separate, limited-scope
+  Calendly token dropped here 2026-10-13 (scope: webhooks:write/read + organizations:read
+  only; issued 2026-10-12). It is NOT the function's CALENDLY_PAT and must not be deployed
+  as one — it lacks users:read + scheduled_events:read and would 403 the sync. Gitignored
+  by *token*.txt. Verified this session that the live secret holds a different, full-scope
+  token (the daily runs still succeed).
+- .gitignore — ignores ac_creds.txt, *creds*.txt, *token*.txt, .env, secrets/.
+
+DEPLOY NOTES
+- Redeploy = Supabase MCP deploy_edge_function with verify_jwt:false, passing the FULL
+  index.ts content (no CLI inliner). A GitHub push does NOT redeploy the live function.
+- Migrations/cron applied via Supabase MCP (apply_migration / execute_sql), because
+  SUPABASE_DB_URL doesn't connect from this box.
+================================================================================

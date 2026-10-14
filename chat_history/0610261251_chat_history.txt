@@ -1,0 +1,174 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-10-06
+Session: Build the calendly-source-sync Supabase edge function (Calendly booking
+         source -> ActiveCampaign Src fields), schedule it Mon-Fri 06:00 PHT,
+         then split its run-log report JSON into a child table and add a manual-
+         invoke command file.
+================================================================================
+
+NOTE ON REDACTIONS: This session read several live credential files and printed
+tool output containing secrets. All have been replaced with [REDACTED_*]
+placeholders here: the ActiveCampaign API token (ac_creds.txt /
+[REDACTED_AC_API_TOKEN]), the Calendly personal access token
+([REDACTED_CALENDLY_PAT]), the Supabase management access token
+(supabase-access-token.txt / [REDACTED_SUPABASE_ACCESS_TOKEN]), and the Supabase
+service-role / anon JWTs and a secret bearer that appeared in the cron.job table
+dump ([REDACTED_SUPABASE_JWT]). No secret value is reproduced in this file.
+
+--------------------------------------------------------------------------------
+USER:
+Invoked with the project at
+C:\Users\Cloverly\claude_code\google_ads_leads_tracking\calendly_ac_automation and
+pointed at initial_prompt.md. The task: "create a supabase edge function to run
+mon-fri daily ph time at 6am. mirror automation steps of claude_task_prompt." The
+referenced files: claude_task_prompt.txt (the automation spec), the Calendly PAT
+file, and ac_creds.txt (AC token + URL). Session started in PLAN MODE.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read the three referenced files. claude_task_prompt.txt specifies a daily
+"Calendly booking source -> ActiveCampaign" sync: read new Calendly bookings
+(last 3 days by created_at), pull each invitee's tracking object
+(utm_source/medium/campaign/term/content + salesforce_uuid which carries
+"gclid:XXXX"/"msclkid:XXXX"), derive a lead channel, find the AC contact by email,
+and write contact custom fields 77-83 ONLY when field 77 is empty (never
+overwrite); skip internal (@myadventuregroup.com.au) / test contacts; never create
+contacts; leave 84-87 blank; emit a per-booking report + totals; flag post-5-Oct
+bookings with no tracking.
+
+Ran two Explore subagents in parallel: (1) the existing new-paid-leads-sync edge
+function + cron pattern in the dashboard repo, (2) existing Calendly/AC code in
+this repo. Key findings: edge functions are single standalone Deno index.ts files
+importing supabase-js from esm.sh; AC auth is the "Api-Token" header against
+AC_API_URL/api/3; functions deploy verify_jwt:false via the Supabase MCP; cron is
+pg_cron+pg_net net.http_post with schedule '0 22 * * 0-4' UTC (= Mon-Fri 06:00
+Philippine time), no auth header. This repo had no supabase/ scaffold yet; it had a
+good Calendly read model (fetch_calendly_bookings in scripts/map_ga4_ac.py: Bearer
+PAT -> /users/me -> /scheduled_events -> {event}/invitees) but NO existing AC-write
+code. Field ids 77-87 only appeared in prompt text.
+
+Inspected the live Supabase project (aivitcomiywiysrfwqxt, "MAGTestProject"):
+confirmed the cron convention from existing jobs (buyer-sheet-sync-daily,
+sales-deals-sync-daily, new-paid-leads-sync-daily all '0 22 * * 0-4', no-auth
+net.http_post), confirmed AC_API_URL/AC_API_TOKEN secrets already exist, found an
+unrelated calendly_bookings_staging table (left untouched), and project URL
+https://aivitcomiywiysrfwqxt.supabase.co. (The cron.job dump included Supabase JWTs
+-> [REDACTED_SUPABASE_JWT].)
+
+Asked the user three scoping questions. Answers: (1) code lives in THIS repo under
+calendly_ac_automation/supabase/...; (2) ADD a run-log table; (3) I set the new
+CALENDLY_PAT secret via the Supabase Management API. Wrote the plan to the plan
+file and exited plan mode (approved).
+
+--------------------------------------------------------------------------------
+USER:
+(Approved the plan.)
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Implemented everything:
+
+Files created in calendly_ac_automation/:
+- supabase/functions/calendly-source-sync/index.ts — the function. Reads Calendly
+  (James's account via /users/me -> user+org, /scheduled_events with a wide
+  min/max_start_time window + sort start_time:desc, paginated; {event}/invitees
+  paginated), filters events to the last N days by created_at (default 3, ?days=N
+  override), collects the tracking fields incl. salesforce_uuid, skips
+  internal/test, dedups by email. Derives gclid/msclkid from salesforce_uuid and a
+  lead-channel ladder (Google Ads / Microsoft Ads / Email / plain label / utm_source
+  / "Unknown (no tracking)"). Finds the AC contact via
+  /api/3/contacts?email=...&include=fieldValues; if none -> "no AC contact"; if
+  field 77 already set -> "skipped - already had source"; else writes 77 (always) +
+  78-83 (when non-empty) via POST /api/3/fieldValues (new) or PUT fieldValues/{id}
+  (existing). Supports ?dryrun=1 (everything except AC writes). Flags post-5-Oct
+  no-tracking bookings. Logs each run and returns the full report as JSON.
+- supabase/migrations/20261006020000_create_calendly_src_sync_runs.sql — log table.
+- supabase/migrations/20261006020100_schedule_calendly_source_sync.sql — cron.
+- README.md — how it works / deploy / manual invoke.
+
+Deploy + wire-up (all verified):
+- Set CALENDLY_PAT secret via POST to the Supabase Management API using
+  supabase-access-token.txt ([REDACTED_SUPABASE_ACCESS_TOKEN]) -> HTTP 201.
+- Applied the log-table migration via MCP.
+- Deployed the function via MCP deploy_edge_function, verify_jwt:false (version 1).
+- Scheduled cron 'calendly-source-sync-daily' '0 22 * * 0-4' (jobid 10, active).
+
+Verification: dry run (?dryrun=1&days=7) returned 4 bookings — 1 would-write, 3
+skipped (field 77 already populated), and a flagged post-5-Oct no-tracking booking
+(Lauren S.). Real run (?days=7) wrote Mark B.'s field 77 = "Unknown (no tracking)".
+Confirmed via (a) a follow-up dry run showing skipped_existing rise to 4 /
+written 0, (b) the log table rows, (c) a direct AC query showing contact 18238
+(mark.bernhardi@enginebystarling.com) field 77 now set with 78-83 correctly left
+blank, and (d) cron.job showing the active schedule. Recorded the feature in
+Claude memory (calendly-source-sync.md + MEMORY.md index). Flagged to the user that
+"Unknown (no tracking)" is written to 77 per spec (permanently fills it), offering
+a one-line change to only stamp 77 when real tracking exists.
+
+--------------------------------------------------------------------------------
+USER:
+"pushed to https://github.com/yen93/calendly_ac_automation"
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Flagged a potential credential risk: ac_creds.txt sits inside the pushed folder and
+holds a live AC token. Checked git: the folder is its own repo, only 6 files are
+tracked (README.md, claude_task_prompt.txt, initial_prompt.md, the 3 supabase
+files) — ac_creds.txt is NOT tracked and none of the tracked files contain secrets,
+so the push is clean. But there was no .gitignore, so a future `git add .` could
+stage ac_creds.txt. Created calendly_ac_automation/.gitignore (ignoring
+ac_creds.txt, *creds*.txt, *token*.txt, .env, secrets/) and told the user to commit
+it. Noted that deployment is via the Supabase MCP, so a GitHub push does not
+redeploy the live function — editing index.ts would need a redeploy.
+
+--------------------------------------------------------------------------------
+USER:
+Asked whether the calendly_src_sync_runs "report" column (a JSON array) could be
+broken out into 5 added columns — dislikes storing a JSON array.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Explained the structural catch: report holds one entry PER BOOKING and a run
+processes many bookings, so the 5 fields can't become 5 columns on the runs table.
+Proposed a child table instead. Asked two questions; user chose: child table
+(recommended) and clear the 3 existing test rows.
+
+Implemented:
+- Updated index.ts: insert the run summary (no more report column), get its id back,
+  then insert one row per booking into calendly_src_sync_bookings.
+- Rewrote 20261006020000_*.sql to define BOTH tables in final form (runs summary +
+  child calendly_src_sync_bookings with run_id FK on-delete-cascade and columns
+  name/domain/booking_date(date)/channel/action, indexed on run_id + channel).
+- Applied the delta to the live DB via MCP (create child table, drop report column,
+  truncate runs restart identity cascade).
+- Redeployed the function (version 2).
+Verified with a dry run + a join query: 1 run row + 4 booking rows, each booking a
+plain row with the 5 columns, no JSON anywhere. Updated the memory note to reflect
+the split schema.
+
+--------------------------------------------------------------------------------
+USER:
+"pls create a txt file of the cmd script to manually invoke the function"
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Created calendly_ac_automation/invoke_commands.txt with ready-to-paste Windows CMD
+curl lines: dry run (3 and 7 days), real run (3 days = what the cron does), real run
+N days, plus notes — no auth header needed (verify_jwt:false), the URL must be
+double-quoted in CMD so the & doesn't split the command, each run is logged to
+calendly_src_sync_runs + calendly_src_sync_bookings, and an optional redirect to
+out.json.
+
+--------------------------------------------------------------------------------
+USER:
+"/save-chat-history" — save the conversation transcript only (no as_built.txt,
+CLAUDE.md, or git).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Checked for an existing chat_history/ folder (none), ran the timestamp command
+(0610261251), performed the mandatory secret scan over the whole conversation, and
+wrote this file with all live secrets redacted.
+
+================================================================================
+END OF EXPORT
+================================================================================

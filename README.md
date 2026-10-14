@@ -10,10 +10,15 @@ manual automation in `claude_task_prompt.txt`.
   `aivitcomiywiysrfwqxt`, deployed `verify_jwt:false`). Reads Calendly (`/users/me`,
   `/scheduled_events`, `{event}/invitees`), derives lead channel + gclid/msclkid from the
   invitee `tracking` object, finds the AC contact by email and writes fields 77–83 via
-  `fieldValues` (POST new / PUT existing). Never creates contacts; read-only on everything
-  in AC except those field values.
-- **Log table** `public.calendly_src_sync_runs` — one row per run (totals, per-booking
-  actions, anomaly flags, errors). Migration `supabase/migrations/20261006020000_*.sql`.
+  `fieldValues` (POST new / PUT existing). If no contact matches, it **creates** the
+  contact first. It then **tags** the contact: `supabase_calendly_ac_automation_new_contact`
+  (created) or `supabase_calendly_ac_automation_update` (existing updated). Touches no
+  other AC fields/lists/deals.
+- **Log tables** `public.calendly_src_sync_runs` (one summary row per run — totals,
+  created/updated/skipped, anomaly flags, errors) + `public.calendly_src_sync_bookings`
+  (one row per **unique email** — upserted on email; name/email/ac_contact_id/domain/
+  booking_date/channel/action; dry runs don't persist booking rows).
+  Migration `supabase/migrations/20261006020000_*.sql`.
 - **Cron** `calendly-source-sync-daily` — `0 22 * * 0-4` UTC = Mon–Fri 06:00 PHT.
   Migration `supabase/migrations/20261006020100_*.sql`.
 
